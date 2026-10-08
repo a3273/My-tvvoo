@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.1.23](https://github.com/qwertyuiop8899/tvvoo/compare/v1.1.22...v1.1.23) (2026-10-07)
+
+
+### Bug Fixes
+
+* add pagination retries with 2s backoff and safeguard against truncated catalog caching ([0dc224b](https://github.com/qwertyuiop8899/tvvoo/commit/0dc224bc7ed76a699c82c0275ba130b4829175ba))
+
+## [1.1.22](https://github.com/qwertyuiop8899/tvvoo/compare/v1.1.21...v1.1.22) (2026-10-02)
+
+
+### Bug Fixes
+
+* optimize No-Freeze manifest proxy with non-blocking background token renewal and HTTP keep-alive ([5790dcc](https://github.com/qwertyuiop8899/tvvoo/commit/5790dcc7b11b528095e79038a65a58ff2fe31287))
+
+## [1.1.21](https://github.com/qwertyuiop8899/tvvoo/compare/v1.1.20...v1.1.21) (2026-09-29)
+
+
+### Bug Fixes
+
+* prevent empty catalog caching and auto-recover on-demand channel lists ([788bbe2](https://github.com/qwertyuiop8899/tvvoo/commit/788bbe2e3b704652b829aeb9d95dc101267a90a3))
+
 ## [1.1.20](https://github.com/qwertyuiop8899/tvvoo/compare/v1.1.19...v1.1.20) (2026-09-28)
 
 

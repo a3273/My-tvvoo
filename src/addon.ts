@@ -5,6 +5,26 @@ import { addonBuilder, Manifest, Stream, getRouter } from 'stremio-addon-sdk';
 /// <reference types="node" />
 import express, { Request, Response, NextFunction } from 'express';
 import fetch from 'node-fetch';
+import http from 'http';
+import https from 'https';
+
+const httpAgent = new http.Agent({
+    keepAlive: true,
+    maxSockets: 100,
+    maxFreeSockets: 20,
+    timeout: 30000,
+    keepAliveMsecs: 30000
+});
+
+const httpsAgent = new https.Agent({
+    keepAlive: true,
+    maxSockets: 100,
+    maxFreeSockets: 20,
+    timeout: 30000,
+    keepAliveMsecs: 30000
+});
+
+const getAgent = (urlStr: string) => (urlStr && urlStr.startsWith('https:')) ? httpsAgent : httpAgent;
 import fs from 'fs';
 import path from 'path';
 // @ts-ignore
@@ -23,6 +43,8 @@ import { normalizeChannelName } from './epg/nameMap';
 // Hardening: log and survive unexpected errors
 process.on('uncaughtException', (err: unknown) => { try { console.error('[VAVOO] uncaughtException', err); } catch { } });
 process.on('unhandledRejection', (reason: unknown) => { try { console.error('[VAVOO] unhandledRejection', reason); } catch { } });
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 // Minimal config: countries supported and mapping to Vavoo group filters
 const SUPPORTED_COUNTRIES = [
@@ -635,13 +657,25 @@ function readCacheFromDisk(): CatalogCache {
     try {
         const raw = fs.readFileSync(CACHE_FILE, 'utf8');
         const j = JSON.parse(raw);
-        if (j && typeof j === 'object' && j.countries) return j as CatalogCache;
+        if (j && typeof j === 'object' && j.countries) {
+            for (const [k, v] of Object.entries(j.countries)) {
+                if (!Array.isArray(v) || v.length === 0) {
+                    delete (j.countries as any)[k];
+                }
+            }
+            return j as CatalogCache;
+        }
     } catch { }
     return { updatedAt: 0, countries: {} };
 }
 
 function writeCacheToDisk(cache: CatalogCache) {
-    try { fs.writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2), 'utf8'); } catch (e) { console.error('Cache write error:', e); }
+    try {
+        if (!cache || !cache.countries) return;
+        const hasValid = Object.values(cache.countries).some(arr => Array.isArray(arr) && arr.length > 0);
+        if (!hasValid) return;
+        fs.writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2), 'utf8');
+    } catch (e) { console.error('Cache write error:', e); }
 }
 
 // On-demand per-country disk cache (keeps memory small and avoids loading all countries)
@@ -656,12 +690,13 @@ function readCountryCatalogFromDisk(cid: string): CountryCatalogFile | null {
         if (!fs.existsSync(file)) return null;
         const raw = fs.readFileSync(file, 'utf8');
         const j = JSON.parse(raw);
-        if (j && typeof j === 'object' && Array.isArray(j.items)) return j as CountryCatalogFile;
+        if (j && typeof j === 'object' && Array.isArray(j.items) && j.items.length > 0) return j as CountryCatalogFile;
     } catch { }
     return null;
 }
 function writeCountryCatalogToDisk(cid: string, data: CountryCatalogFile) {
     try {
+        if (!data || !Array.isArray(data.items) || data.items.length === 0) return;
         ensureDir(CAT_CACHE_DIR);
         const file = path.join(CAT_CACHE_DIR, `${cid}.json`);
         fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
@@ -709,10 +744,10 @@ async function getOrFetchCountryCatalog(cid: string): Promise<any[]> {
     try {
         // 1) In-memory
         const mem = currentCache.countries[cid];
-        if (mem && mem.length) return mem;
+        if (mem && Array.isArray(mem) && mem.length > 0) return mem;
         // 2) Disk cache (permanent until restart; no TTL)
         const disk = readCountryCatalogFromDisk(cid);
-        if (disk && Array.isArray(disk.items)) {
+        if (disk && Array.isArray(disk.items) && disk.items.length > 0) {
             currentCache.countries[cid] = disk.items;
             return disk.items;
         }
@@ -723,7 +758,7 @@ async function getOrFetchCountryCatalog(cid: string): Promise<any[]> {
         // 3) Fetch on demand
         const c = SUPPORTED_COUNTRIES.find(x => x.id === cid);
         if (!c) return [];
-        const sig = await getVavooSignature(null);
+        let sig = await getVavooSignature(null);
         if (!sig) return [];
         vdbg('CATALOG FETCH start', { cid });
         inflightCatalogFetch[cid] = withCatalogFetchSlot(async () => {
@@ -731,23 +766,44 @@ async function getOrFetchCountryCatalog(cid: string): Promise<any[]> {
             let items: any[] = [];
             for (const g of groupCandidates) {
                 try {
-                    items = await vavooCatalog(g, sig);
-                    if (items && items.length) break;
+                    const res = await vavooCatalog(g, sig);
+                    if (res && res.length) { items = res; break; }
                 } catch { }
             }
             if (!items || !items.length) {
-                try { items = await vavooCatalog(c.group, sig); } catch { }
+                try {
+                    const freshSig = await getVavooSignature(null);
+                    if (freshSig) {
+                        sig = freshSig;
+                        const res = await vavooCatalog(c.group, freshSig);
+                        if (res && res.length) items = res;
+                    }
+                } catch { }
             }
-            const slim = (items || []).map((it: any) => ({
+            if (!items || !items.length) {
+                vdbg('CATALOG FETCH empty or failed', { cid });
+                return currentCache.countries[cid] || [];
+            }
+            const slim = items.map((it: any) => ({
                 name: cleanupChannelName(String(it?.name || 'Unknown')),
                 url: String((it && (it.url || it.play || it.href || it.link)) || ''),
                 poster: it?.poster || it?.image || undefined,
                 description: undefined,
             }));
-            currentCache.countries[cid] = slim;
-            writeCountryCatalogToDisk(cid, { updatedAt: Date.now(), items: slim });
+            const existingCount = currentCache.countries[cid]?.length || 0;
+            const isTruncated = cid === 'it' && slim.length < 350 && existingCount >= 350;
+            if (slim.length > 0 && !isTruncated) {
+                currentCache.countries[cid] = slim;
+                writeCountryCatalogToDisk(cid, { updatedAt: Date.now(), items: slim });
+                if ((globalThis as any).__vavooMetasCache) {
+                    delete (globalThis as any).__vavooMetasCache[cid];
+                }
+            } else if (isTruncated) {
+                console.warn(`[CATALOG] Preserving existing Italy cache (${existingCount} items) instead of truncated fetch (${slim.length} items)`);
+                return currentCache.countries[cid] || [];
+            }
             // Italy: refresh logos/categories from M3U occasionally
-            if (cid === 'it' && Date.now() - lastM3UUpdate > 6 * 60 * 60 * 1000) {
+            if (cid === 'it' && slim.length > 0 && Date.now() - lastM3UUpdate > 6 * 60 * 60 * 1000) {
                 try { await updateLogosFromM3U(); lastM3UUpdate = Date.now(); } catch { }
             }
             vdbg('CATALOG FETCH done', { cid, count: slim.length });
@@ -896,7 +952,7 @@ async function getVavooSignature(clientIp: string | null) {
         'Accept-Language': 'de'
     };
     vdbg('PING ipLocation', clientIp);
-    const res = await fetch('https://www.vypn.net/api/app/ping', { method: 'POST', headers, body: JSON.stringify(body), timeout: 8000 } as any);
+    const res = await fetch('https://www.vypn.net/api/app/ping', { method: 'POST', headers, body: JSON.stringify(body), agent: getAgent('https://www.vypn.net/api/app/ping'), timeout: 8000 } as any);
     if (!res.ok) return null;
     const json: any = await res.json();
     return json?.addonSig || null;
@@ -930,7 +986,7 @@ function buildTsFallbackUrl(vavooPlayUrl: string, tsSig: string): string | null 
     return `${base}.ts?n=1&b=5&vavoo_auth=${encodeURIComponent(tsSig)}`;
 }
 
-async function vavooCatalog(group: string, signature: string) {
+async function vavooCatalog(group: string, signature: string): Promise<any[] | null> {
     const headers: any = {
         'user-agent': VAVOO_API_UA,
         'accept': 'application/json',
@@ -940,13 +996,48 @@ async function vavooCatalog(group: string, signature: string) {
     };
     const out: any[] = [];
     let cursor: any = 0;
+    let page = 0;
     do {
+        page++;
+        if (page > 1) {
+            await sleep(300); // polite pause between pages
+        }
         const body = { language: 'de', region: 'AT', catalogId: 'iptv', id: 'iptv', adult: false, search: '', sort: 'name', filter: { group }, cursor, clientVersion: '3.1.0' };
-        const res = await fetch('https://vavoo.to/mediahubmx-catalog.json', { method: 'POST', headers, body: JSON.stringify(body), timeout: 10000 } as any);
-        if (!res.ok) break;
-        const j: any = await res.json();
-        out.push(...(j?.items || []));
-        cursor = j?.nextCursor;
+        let success = false;
+        let lastErr = '';
+        for (let attempt = 0; attempt < 3; attempt++) {
+            if (attempt > 0) {
+                console.warn(`[CATALOG] Retrying page ${page} for group ${group} (cursor: ${cursor}) in 2s (attempt ${attempt + 1}/3)...`);
+                await sleep(2000);
+            }
+            try {
+                const res = await fetch('https://vavoo.to/mediahubmx-catalog.json', {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify(body),
+                    agent: getAgent('https://vavoo.to/mediahubmx-catalog.json'),
+                    timeout: 12000
+                } as any);
+                if (!res.ok) {
+                    lastErr = `HTTP ${res.status}`;
+                    console.warn(`[CATALOG] vavooCatalog response not ok for group ${group} (page ${page}, attempt ${attempt + 1}): ${lastErr}`);
+                    continue;
+                }
+                const j: any = await res.json();
+                out.push(...(j?.items || []));
+                cursor = j?.nextCursor;
+                success = true;
+                break;
+            } catch (fetchErr: any) {
+                lastErr = fetchErr?.message || String(fetchErr);
+                console.warn(`[CATALOG] vavooCatalog fetch error for group ${group} (page ${page}, attempt ${attempt + 1}):`, lastErr);
+            }
+        }
+        if (!success) {
+            console.error(`[CATALOG] vavooCatalog failed to fetch page ${page} for group ${group} after retries: ${lastErr}`);
+            // Incomplete pagination: return null so callers preserve the existing complete cache
+            return null;
+        }
     } while (cursor);
     return out;
 }
@@ -959,7 +1050,7 @@ async function resolveVavooPlay(url: string, signature: string): Promise<string 
         'accept-encoding': 'gzip',
         'mediahubmx-signature': signature
     };
-    const res = await fetch('https://vavoo.to/mediahubmx-resolve.json', { method: 'POST', headers, body: JSON.stringify({ language: 'de', region: 'AT', url, clientVersion: '3.1.0' }), timeout: 8000 } as any);
+    const res = await fetch('https://vavoo.to/mediahubmx-resolve.json', { method: 'POST', headers, body: JSON.stringify({ language: 'de', region: 'AT', url, clientVersion: '3.1.0' }), agent: getAgent('https://vavoo.to/mediahubmx-resolve.json'), timeout: 8000 } as any);
     if (!res.ok) return null;
     const j: any = await res.json();
     if (Array.isArray(j) && j[0]?.url) return String(j[0].url);
@@ -1029,7 +1120,8 @@ async function resolveVavooCleanUrl(vavooPlayUrl: string, clientIp: string | nul
             method: 'POST',
             headers: pingHeaders,
             body: JSON.stringify(pingBody),
-            timeout: 12000
+            agent: getAgent('https://www.vypn.net/api/app/ping'),
+            timeout: 10000
         } as any);
         vdbg('Ping response', { status: (pingRes as any).status, ok: (pingRes as any).ok, tookMs: Date.now() - startedAt });
 
@@ -1052,7 +1144,8 @@ async function resolveVavooCleanUrl(vavooPlayUrl: string, clientIp: string | nul
                 method: 'POST',
                 headers: fallbackHeaders,
                 body: JSON.stringify(fallbackBody),
-                timeout: 12000
+                agent: getAgent('https://www.vypn.net/api/app/ping'),
+                timeout: 10000
             } as any);
             vdbg('Ping fallback response', { status: (pingRes2 as any).status, ok: (pingRes2 as any).ok });
             if (!pingRes2.ok) return null;
@@ -1118,7 +1211,8 @@ async function resolveVavooCleanUrl(vavooPlayUrl: string, clientIp: string | nul
             method: 'POST',
             headers: resolveHeaders,
             body: JSON.stringify({ language: 'de', region: 'AT', url: vavooPlayUrl, clientVersion: '3.1.0' }),
-            timeout: 12000
+            agent: getAgent('https://vavoo.to/mediahubmx-resolve.json'),
+            timeout: 10000
         } as any);
         vdbg('Resolve response', { status: (resolveRes as any).status, ok: (resolveRes as any).ok, tookMs: Date.now() - startedAt });
         if (resolveRes.ok) {
@@ -1991,14 +2085,21 @@ class LiveManifestManager {
         let session = this.sessions.get(key);
         const now = Date.now();
 
-        if (!session || (session.validUntil - now) < 150 * 1000) {
+        // 1. Initial resolution if session does not exist or token has completely expired
+        if (!session || session.validUntil <= now) {
             session = await this.refreshSession(session, playUrl, clientIp, resolveFn);
+        } else if ((session.validUntil - now) < 5 * 60 * 1000 && !session.refreshPromise) {
+            // 2. Proactive non-blocking background token renewal when < 5 mins left
+            // Does NOT block the current request — player keeps receiving manifests seamlessly
+            this.refreshSession(session, playUrl, clientIp, resolveFn).catch(err => {
+                console.warn(`[LiveManifest] Background token renewal error:`, err?.message);
+            });
         }
 
         session.lastFetchedAt = now;
 
-        // Throttle rapid repeated manifest requests (< 2 seconds)
-        if (session.lastManifest && (now - session.lastManifestTime) < 2000) {
+        // 3. Fast throttle for rapid repeated manifest requests (< 1.5 seconds)
+        if (session.lastManifest && (now - session.lastManifestTime) < 1500) {
             return session.lastManifest;
         }
 
@@ -2008,7 +2109,8 @@ class LiveManifestManager {
                     'User-Agent': 'VAVOO/2.6',
                     'Accept': '*/*'
                 },
-                timeout: 8000
+                agent: getAgent(streamUrl),
+                timeout: 3500
             } as any);
             if (res.status === 403 || res.status === 401) {
                 throw new Error(`Upstream auth error: ${res.status}`);
@@ -2023,7 +2125,17 @@ class LiveManifestManager {
         try {
             rawM3u8 = await fetchUpstream(session.streamUrl);
         } catch (err: any) {
-            console.warn(`[LiveManifest] Upstream fetch failed (${err.message}), re-resolving immediately...`);
+            console.warn(`[LiveManifest] Upstream fetch issue (${err.message}) for ${playUrl.substring(0, 80)}`);
+
+            // If we have an existing recent manifest (< 10 seconds), serve it immediately to prevent player buffer stall!
+            if (session.lastManifest && (now - session.lastManifestTime) < 10000) {
+                if (err.message && (err.message.includes('auth error') || err.message.includes('403') || err.message.includes('401'))) {
+                    this.refreshSession(session, playUrl, clientIp, resolveFn).catch(() => {});
+                }
+                return session.lastManifest;
+            }
+
+            // Otherwise refresh synchronously
             session = await this.refreshSession(session, playUrl, clientIp, resolveFn);
             rawM3u8 = await fetchUpstream(session.streamUrl);
         }
@@ -2062,8 +2174,8 @@ class LiveManifestManager {
                 baseUrl,
                 validUntil,
                 lastFetchedAt: Date.now(),
-                lastManifest: null,
-                lastManifestTime: 0,
+                lastManifest: current?.lastManifest || null,
+                lastManifestTime: current?.lastManifestTime || 0,
                 refreshPromise: null
             };
 
@@ -2101,6 +2213,7 @@ class LiveManifestManager {
 }
 
 const liveManifestManager = new LiveManifestManager();
+
 // --- END MANIFEST-ONLY NO-FREEZE MANAGER ---
 
 // Live M3U8 Manifest Proxy Endpoint (Auto token renewal, 0% video bandwidth)
@@ -2478,7 +2591,19 @@ app.get('/debug/resolve', async (req: Request, res: Response) => {
 });
 // Cache status endpoint (not listing full data)
 app.get('/cache/status', (_req: Request, res: Response) => {
-    res.json({ updatedAt: currentCache.updatedAt, countries: Object.keys(currentCache.countries) });
+    const counts: Record<string, number> = {};
+    for (const [k, v] of Object.entries(currentCache.countries)) {
+        counts[k] = Array.isArray(v) ? v.length : 0;
+    }
+    res.json({ updatedAt: currentCache.updatedAt, countries: Object.keys(currentCache.countries), counts });
+});
+app.get('/cache/reload', async (_req: Request, res: Response) => {
+    try {
+        refreshDailyCache().catch(() => {});
+        res.json({ ok: true, message: 'Refresh triggered' });
+    } catch (e: any) {
+        res.status(500).json({ error: e?.message });
+    }
 });
 // EPG status and lookup endpoints
 app.get('/epg/status', (_req: Request, res: Response) => {
@@ -2723,25 +2848,31 @@ async function refreshDailyCache() {
     refreshing = true;
     try {
         vdbg('Refreshing daily Vavoo catalog cache…');
-        const sig = await getVavooSignature(null);
+        let sig = await getVavooSignature(null);
         if (!sig) throw new Error('No signature');
         const countries: Record<string, any[]> = {};
         for (const c of SUPPORTED_COUNTRIES) {
             if (VAVOO_REFRESH_WHITELIST && !VAVOO_REFRESH_WHITELIST.has(c.id)) {
-                countries[c.id] = [];
+                if (currentCache.countries[c.id]?.length) countries[c.id] = currentCache.countries[c.id];
                 continue;
             }
             try {
                 // Try primary group, then a few fallbacks for regions that might have alternate group names
                 const groupCandidates = [c.group, ...(c.id === 'nl' ? ['Netherlands', 'Holland'] : [])];
-                let items: any[] = [];
+                let items: any[] | null = null;
                 for (const g of groupCandidates) {
                     items = await vavooCatalog(g, sig);
                     if (items && items.length) break;
                 }
-                // lightweight retry if first attempt returns empty (transient upstream timeouts)
+                // retry with fresh signature if first attempt failed or was incomplete
                 if (!items || items.length === 0) {
-                    try { items = await vavooCatalog(c.group, sig); } catch { }
+                    try {
+                        const freshSig = await getVavooSignature(null);
+                        if (freshSig) {
+                            sig = freshSig;
+                            items = await vavooCatalog(c.group, freshSig);
+                        }
+                    } catch { }
                 }
                 const slim = (items || []).map((it: any) => ({
                     name: cleanupChannelName(String(it?.name || 'Unknown')),
@@ -2750,16 +2881,37 @@ async function refreshDailyCache() {
                     poster: it?.poster || it?.image || undefined,
                     description: undefined,
                 }));
-                countries[c.id] = slim;
-                vdbg('Fetched', c.id, slim.length, 'items');
+                const existingCount = currentCache.countries[c.id]?.length || 0;
+                const isTruncated = c.id === 'it' && slim.length < 350 && existingCount >= 350;
+                if (slim.length > 0 && !isTruncated) {
+                    countries[c.id] = slim;
+                    writeCountryCatalogToDisk(c.id, { updatedAt: Date.now(), items: slim });
+                    if ((globalThis as any).__vavooMetasCache) {
+                        delete (globalThis as any).__vavooMetasCache[c.id];
+                    }
+                    vdbg('Fetched', c.id, slim.length, 'items');
+                } else if (currentCache.countries[c.id]?.length) {
+                    countries[c.id] = currentCache.countries[c.id];
+                    vdbg('Retained existing cache for', c.id, countries[c.id].length, 'items');
+                } else {
+                    countries[c.id] = [];
+                }
             } catch (e) {
                 console.error('Fetch error for', c.id, e);
-                countries[c.id] = [];
+                if (currentCache.countries[c.id]?.length) {
+                    countries[c.id] = currentCache.countries[c.id];
+                } else {
+                    countries[c.id] = [];
+                }
             }
+            await sleep(500); // 500ms delay between countries to avoid Cloudflare rate limiting
         }
-        currentCache = { updatedAt: Date.now(), countries };
-        writeCacheToDisk(currentCache);
-        vdbg('Cache refresh complete at', new Date(currentCache.updatedAt).toISOString());
+        const hasValidData = Object.values(countries).some(arr => arr.length > 0);
+        if (hasValidData) {
+            currentCache = { updatedAt: Date.now(), countries };
+            writeCacheToDisk(currentCache);
+            vdbg('Cache refresh complete at', new Date(currentCache.updatedAt).toISOString());
+        }
         // After refreshing catalogs, enrich Italy logos/categories from M3U only (non-Italy uses static lists)
         await updateLogosFromM3U();
     } catch (e) {
